@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>USD/IDR forecast</title>
+  <style>
+    body { margin: 0; background: #fafaf8; color: #252925; font: 16px/1.5 "Segoe UI", sans-serif; }
+    main { width: min(620px, calc(100% - 32px)); margin: 40px auto; }
+    h1 { margin: 0; font-size: 32px; }
+    h2 { font-size: 18px; }
+    h3 { font-size: 16px; margin: 0; }
+    form section, .results { border-top: 1px solid #d9ded8; margin-top: 20px; padding-top: 6px; }
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    input, select, button { padding: 6px 8px; font: inherit; }
+    input { width: 60px; }
+    button { color: white; background: #24553b; border: 1px solid #24553b; border-radius: 4px; cursor: pointer; }
+    .reset { color: #24553b; background: transparent; }
+    .comparison { display: flex; flex-wrap: wrap; gap: 18px; }
+    .comparison > div { flex: 1 1 235px; }
+    .comparison ul { margin: 6px 0; padding-left: 20px; }
+    .error { color: #962d21; }
+    figure { margin: 22px 0; }
+    figcaption { color: #555d55; font-size: 14px; }
+    svg { display: block; width: 100%; }
+    details { margin: 10px 0; }
+    summary { cursor: pointer; }
+    pre { overflow: auto; max-height: 440px; padding: 10px; background: #eef0ec; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px; border-bottom: 1px solid #d9ded8; }
+    th:last-child, td:last-child { text-align: right; }
+  </style>
+</head>
+<body>
+  <main>
+    {% if source_files is defined %}
+      <p><a href="{{ url_for('index') }}">Back to the demo</a></p>
+      <h1>Source code</h1>
+      <p>Serial and OpenMP use the same C++ file. The OpenMP build uses <code>-fopenmp</code> to turn on the thread code.</p>
+      {% for name, content in source_files %}
+        <details{% if loop.first %} open{% endif %}>
+          <summary><code>{{ name }}</code></summary>
+          <pre tabindex="0"><code>{{ content }}</code></pre>
+        </details>
+      {% endfor %}
+    {% else %}
+      <h1>USD/IDR forecast</h1>
+      <p>Indonesian rupiah per US dollar</p>
+      {% if error and action not in ("demo", "reset", "forecast") %}
+        <p class="error" role="alert">{{ error }}</p>
+      {% endif %}
+      <form method="post" action="{{ url_for('index') }}">
+        <button type="submit" name="action" value="forecast" formaction="{{ url_for('index') }}#forecast" hidden>Run forecast</button>
+        <input type="hidden" name="demo_step" value="{{ demo_step }}">
+        <input type="hidden" name="previous_mode" value="{{ previous_mode }}">
+        <input type="hidden" name="previous_threads" value="{{ previous_threads }}">
+
+        <div class="controls">
+          <label for="openmp-threads">OpenMP threads</label>
+          <select id="openmp-threads" name="threads">
+            {% for count in thread_choices %}
+              <option value="{{ count }}"{% if count == threads %} selected{% endif %}>{{ count }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <section id="training-demo">
+          <h2>Try a training step</h2>
+          <p>Compare how Serial and OpenMP split the six calculations in a training step.</p>
+          <div class="controls">
+            <label for="demo-mode">Mode</label>
+            <select id="demo-mode" name="mode">
+              <option value="serial"{% if mode == "serial" %} selected{% endif %}>Serial (normal)</option>
+              <option value="openmp"{% if mode == "openmp" %} selected{% endif %}>OpenMP</option>
+              <option value="compare"{% if mode == "compare" %} selected{% endif %}>Compare both</option>
+            </select>
+            <button type="submit" name="action" value="demo" formaction="{{ url_for('index') }}#training-demo">Train one step</button>
+            {% if demo_step %}
+              <button class="reset" type="submit" name="action" value="reset" formaction="{{ url_for('index') }}#training-demo">Start over</button>
+            {% endif %}
+          </div>
+          {% if error and action in ("demo", "reset") %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          {% if demo_results %}
+            <p>Step {{ demo_step }} of {{ max_demo_steps }}</p>
+            <div class="comparison">
+              {% for version, result in demo_results.items() %}
+                <div>
+                  <h3>{{ "Serial" if version == "serial" else "OpenMP" }}</h3>
+                  <ul>
+                    {% for jobs in result.groups %}
+                      <li>Thread {{ loop.index }} · {{ jobs | join(", ") }}</li>
+                    {% endfor %}
+                  </ul>
+                  <p>Training error {{ "%.2f" | format(result.error_before) }} → {{ "%.2f" | format(result.error_after) }}</p>
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+          <p><a href="{{ url_for('source') }}">View source code</a></p>
+        </section>
+
+        <section id="forecast">
+          <h2>Forecast and timing</h2>
+          <div class="controls">
+            <label for="days-ahead">Days ahead</label>
+            <input id="days-ahead" name="steps" type="number" min="{{ forecast_days[0] }}" max="{{ forecast_days[1] }}" value="{{ days }}" required>
+            <button type="submit" name="action" value="forecast" formaction="{{ url_for('index') }}#forecast">Run forecast</button>
+          </div>
+          {% if error and action == "forecast" %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+        </section>
+      </form>
+
+      {% if chart %}
+        <figure>
+          <svg viewBox="0 0 620 195" role="img" aria-label="USD/IDR exchange rates{% if report %} with forecast{% endif %}">
+            <g fill="#555d55" font-size="12" dominant-baseline="middle">
+              {% for y, label in chart.ticks %}
+                <line x1="50" x2="610" y1="{{ y }}" y2="{{ y }}" stroke="#d9ded8" />
+                <text x="0" y="{{ y }}">{{ label }}</text>
+              {% endfor %}
+              <text x="50" y="181">{{ chart.first_day }}</text>
+              <text x="610" y="181" text-anchor="end">{{ chart.last_day }}</text>
+            </g>
+            <polyline points="{{ chart.history }}" fill="none" stroke="#445a72" stroke-width="2" />
+            {% if chart.forecast %}
+              <polyline points="{{ chart.forecast }}" fill="none" stroke="#24553b" stroke-width="2" stroke-dasharray="5 4" />
+            {% endif %}
+          </svg>
+          <figcaption>Solid line: past rates{% if report %} · Dashed line: forecast{% endif %}</figcaption>
+        </figure>
+      {% endif %}
+
+      {% if report %}
+        <section class="results">
+          <h2>Training time</h2>
+          <div class="comparison">
+            <div>Serial <strong>{{ "%.2f" | format(report.timings.serial.median_ms) }} ms</strong></div>
+            <div>OpenMP ({{ report.timings.openmp.workers }} {{ "thread" if report.timings.openmp.workers == 1 else "threads" }})
+              <strong>{{ "%.2f" | format(report.timings.openmp.median_ms) }} ms</strong></div>
+          </div>
+          <details>
+            <summary>Daily forecast values ({{ report.forecast | length }} days)</summary>
+            <table>
+              <thead><tr><th scope="col">Date</th><th scope="col">Predicted IDR</th></tr></thead>
+              <tbody>
+                {% for point in report.forecast %}
+                  <tr><td>{{ point.date }}</td><td>{{ "{:,.2f}".format(point.serial) }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </details>
+        </section>
+      {% endif %}
+    {% endif %}
+  </main>
+</body>
+</html>
