@@ -2,10 +2,6 @@
 
 This app reads data.csv and compares Serial and OpenMP training times.
 
-## Setup on Windows
-
-Install Python 3.10 or newer and MSYS2 UCRT64 GCC. In VS Code, install the Microsoft Python and Python Debugger extensions.
-
 Open this folder in VS Code and run these commands in the terminal:
 
 ```powershell
