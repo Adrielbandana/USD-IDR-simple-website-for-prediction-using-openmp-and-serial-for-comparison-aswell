@@ -1,4 +1,5 @@
 import csv
+import io
 import json
 import math
 import os
@@ -8,20 +9,27 @@ import subprocess
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from threading import Lock
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, url_for
+from werkzeug.datastructures import ImmutableMultiDict
+from werkzeug.exceptions import RequestEntityTooLarge
 
 ROOT = Path(__file__).resolve().parent
 BENCHMARK_RUNS = 3
 MODES = ("serial", "openmp")
+DEMO_MODES = ("serial", "openmp", "compare")
 PREDICTION_LIMITS = {
-    "steps": (22, 1, 60),
+    "steps": (22, 1, 365),
     "iterations": (5000, 100, 20000),
     "threads": (4, 1, 6),
 }
 BENCHMARK_LOCK = Lock()
 DEMO_STEPS = 10
+TEST_DAYS = 7
+UPLOAD_NAME = "uploaded-rates.csv"
+UPLOAD_LIMIT = 2 * 1024 * 1024
 THREAD_CHOICES = (1, 2, 4, 6)
 CPP_SOURCE = "cpp/usd_idr_prediction.cpp"
 SOURCE_FILES = (CPP_SOURCE, "app.py", "templates/index.html")
@@ -56,23 +64,75 @@ def build_models():
             shutil.copy2(library, build)
 
 
-def load_rates():
+def read_rates(file):
+    sample = file.readline(4096)
+    file.seek(0)
+    try:
+        delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter
+    except csv.Error:
+        delimiter = ","
+    reader = csv.DictReader(file, delimiter=delimiter)
+    columns = {name.strip().casefold().replace(" ", "_"): name for name in reader.fieldnames or []}
+    date_column = columns.get("date") or columns.get("observation_date")
+    rate_column = None
+    for name in ("usd_idr_rate", "usd_idr", "usdidr", "rate", "close", "price"):
+        if name in columns:
+            rate_column = columns[name]
+            break
+    if not date_column or not rate_column:
+        raise ValueError("Use a CSV with a Date column and a USD_IDR_Rate, Rate, or Close column.")
+
     rows = []
-    with (ROOT / "data.csv").open(encoding="utf-8-sig", newline="") as file:
-        for row in csv.DictReader(file):
-            day = date.fromisoformat(row["Date"])
-            rate = float(row["USD_IDR_Rate"])
-            if not math.isfinite(rate) or rate <= 0:
-                raise ValueError("Every rate in data.csv must be positive and finite.")
-            rows.append((day, rate))
+    for row in reader:
+        value = (row[rate_column] or "").strip()
+        if value.lower() in ("", ".", "n/a", "null"):
+            continue
+        try:
+            day = date.fromisoformat((row[date_column] or "").strip())
+            rate = float(value)
+        except ValueError:
+            raise ValueError(f"Line {reader.line_num} needs a YYYY-MM-DD date and a numeric rate.") from None
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError(f"The rate on line {reader.line_num} must be positive and finite.")
+        rows.append((day, rate))
+        if len(rows) > 10000:
+            raise ValueError("The CSV can contain up to 10,000 rates.")
     rows.sort()
-    if not 3 <= len(rows) <= 10000:
-        raise ValueError("data.csv needs 3–10,000 observations.")
+    if len(rows) < 3:
+        raise ValueError("The CSV needs at least three dated rates.")
     if any(left[0] == right[0] for left, right in zip(rows, rows[1:])):
-        raise ValueError("data.csv contains duplicate dates.")
+        raise ValueError("The CSV contains duplicate dates. Keep one rate per date.")
     if all(rate == rows[0][1] for _, rate in rows):
-        raise ValueError("data.csv needs at least two distinct rates.")
+        raise ValueError("The CSV needs at least two different rates.")
     return rows
+
+
+def load_rates():
+    try:
+        file = (ROOT / UPLOAD_NAME).open(encoding="utf-8-sig", newline="")
+    except FileNotFoundError:
+        file = (ROOT / "data.csv").open(encoding="utf-8-sig", newline="")
+    with file:
+        return read_rates(file)
+
+
+def save_upload(rows):
+    temp = NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=ROOT, delete=False)
+    path = Path(temp.name)
+    try:
+        with temp as file:
+            writer = csv.writer(file)
+            writer.writerow(("Date", "USD_IDR_Rate"))
+            writer.writerows(rows)
+        path.replace(ROOT / UPLOAD_NAME)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def model_input(rows, iterations, steps, threads):
+    # C++ reads the run settings first, then the rates.
+    rates = " ".join(str(rate) for _, rate in rows)
+    return f"{len(rows)} {iterations} {steps} {threads}\n{rates}\n"
 
 
 def run_model(mode, input_text, *, demo=False):
@@ -97,11 +157,9 @@ def run_model(mode, input_text, *, demo=False):
 
 
 def run_benchmark(rows, steps, iterations, threads):
-    rates = " ".join(str(rate) for _, rate in rows)
-    input_header = f"{len(rows)} {iterations} {steps}"
     model_inputs = {
-        "serial": f"{input_header} 1\n{rates}\n",
-        "openmp": f"{input_header} {threads}\n{rates}\n",
+        "serial": model_input(rows, iterations, steps, 1),
+        "openmp": model_input(rows, iterations, steps, threads),
     }
     runs = {mode: [] for mode in MODES}
     for trial in range(BENCHMARK_RUNS):
@@ -122,21 +180,37 @@ def run_benchmark(rows, steps, iterations, threads):
 
 
 def run_demo(rows, mode, step, threads):
-    rates = " ".join(str(rate) for _, rate in rows)
     results = {}
     for version in MODES if mode == "compare" else (mode,):
         workers = 1 if version == "serial" else threads
-        model_input = f"{len(rows)} {step} 1 {workers}\n{rates}\n"
-        trace = run_model(version, model_input, demo=True)
+        trace = run_model(version, model_input(rows, step, 1, workers), demo=True)
         if "threads" not in trace:
             raise RuntimeError("Rebuild both versions with Ctrl+Shift+B to use the training demo.")
         results[version] = trace
     return results
 
 
+def uses_weekdays(rows):
+    if not rows or (rows[-1][0] - rows[0][0]).days < 7:
+        return False
+    return all(day.weekday() < 5 for day, _ in rows)
+
+
+def forecast_dates(rows, steps):
+    day = rows[-1][0]
+    weekdays_only = uses_weekdays(rows)
+    dates = []
+    while len(dates) < steps:
+        if day == date.max:
+            raise ValueError("The end of the forecast is outside the supported date range.")
+        day += timedelta(days=1)
+        if not weekdays_only or day.weekday() < 5:
+            dates.append(day)
+    return dates
+
+
 def make_forecast(rows, steps, iterations, threads):
-    last_day = rows[-1][0]
-    dates = [last_day + timedelta(days=offset) for offset in range(1, steps + 1)]
+    dates = forecast_dates(rows, steps)
     serial, openmp, timings = run_benchmark(rows, steps, iterations, threads)
     forecast = []
     for day, serial_rate, openmp_rate in zip(dates, serial["forecast"], openmp["forecast"], strict=True):
@@ -151,6 +225,29 @@ def make_forecast(rows, steps, iterations, threads):
         "timings": timings,
         "speedup": timings["serial"]["median_ms"] / openmp_ms if openmp_ms > 0 else None,
         "rmse": serial["rmse"],
+    }
+
+
+def test_week(rows, cutoff):
+    training_rows = [row for row in rows if row[0] <= cutoff]
+    first_test = len(training_rows)
+    test_rows = rows[first_test:first_test + TEST_DAYS]
+    if first_test < 3 or training_rows[-1][0] != cutoff or len(test_rows) != TEST_DAYS:
+        raise ValueError("Pick a date in the CSV with at least two earlier rates and seven later rates.")
+
+    last_known_rate = training_rows[-1][1]
+    iterations = PREDICTION_LIMITS["iterations"][0]
+    # Train on data through the cutoff before comparing the predictions with the held-out week.
+    predictions = run_model("serial", model_input(training_rows, iterations, TEST_DAYS, 1))["forecast"]
+    days = [
+        {"date": day, "predicted": prediction, "actual": rate}
+        for (day, rate), prediction in zip(test_rows, predictions, strict=True)
+    ]
+    return {
+        "cutoff": cutoff,
+        "days": days,
+        "model_error": statistics.mean(abs(day["predicted"] - day["actual"]) for day in days),
+        "baseline_error": statistics.mean(abs(last_known_rate - day["actual"]) for day in days),
     }
 
 
@@ -177,6 +274,36 @@ def make_chart(rows, forecast):
     }
 
 
+def make_daily_chart(forecast):
+    left, margin, date_spacing = 78, 42, 66
+    top, bottom = 16, 141
+    width = max(330, left + date_spacing * (len(forecast) - 1) + margin)
+    rates = [point["serial"] for point in forecast]
+    low, high = min(rates), max(rates)
+    padding = max((high - low) * 0.08, 0.01)
+    low, high = low - padding, high + padding
+
+    def y_at(rate):
+        return bottom - (bottom - top) * (rate - low) / (high - low)
+
+    days = []
+    for index, point in enumerate(forecast):
+        x = left + (width - left - margin) * index / max(1, len(forecast) - 1)
+        days.append({
+            "label": date.fromisoformat(point["date"]).strftime("%d %b"),
+            "x": round(x, 2),
+            "y": round(y_at(point["serial"]), 2),
+        })
+    return {
+        "width": width,
+        "days": days,
+        "guides": " ".join(f"M{day['x']} {top}V{bottom + 5}" for day in days),
+        "dots": " ".join(f"M{day['x']} {day['y']}h.01" for day in days),
+        "line": " ".join(f"{day['x']},{day['y']}" for day in days),
+        "ticks": [(round(y_at(rate), 2), f"{rate:,.2f}") for rate in (low, (low + high) / 2, high)],
+    }
+
+
 def group_calculations(report):
     groups = [[] for _ in range(report["workers"])]
     jobs = ("a + h", "a − h", "b + h", "b − h", "c + h", "c − h")
@@ -187,50 +314,75 @@ def group_calculations(report):
 
 @app.route("/", methods=["GET", "POST"])
 def index():
+    if request.method == "POST":
+        return show_dashboard(request.form)
+    return show_dashboard()
+
+
+def show_dashboard(form=None, *, dataset_error=""):
+    submitted = form is not None
+    if not submitted:
+        form = ImmutableMultiDict()
+
     default_days, minimum_days, maximum_days = PREDICTION_LIMITS["steps"]
     default_threads = PREDICTION_LIMITS["threads"][0]
-    days = request.form.get("steps", default_days, type=int)
-    threads = request.form.get("threads", default_threads, type=int)
-    mode = request.form.get("mode", "serial")
-    demo_step = min(DEMO_STEPS, max(0, request.form.get("demo_step", 0, type=int)))
-    previous_mode = request.form.get("previous_mode", "")
-    previous_threads = request.form.get("previous_threads", 0, type=int)
-    action = request.form.get("action")
+    entered_days = form.get("steps", type=int)
+    entered_threads = form.get("threads", type=int)
+    days = default_days if entered_days is None else entered_days
+    threads = default_threads if entered_threads is None else entered_threads
+    mode = form.get("mode", "serial")
+    demo_step = min(DEMO_STEPS, max(0, form.get("demo_step", 0, type=int)))
+    previous_mode = form.get("previous_mode", "")
+    previous_threads = form.get("previous_threads", 0, type=int)
+    action = form.get("action")
+    cutoff = form.get("cutoff", "")
     error = ""
     rows = []
+    cutoffs = []
     report = None
+    week = None
     demo_results = {}
 
     try:
         rows = load_rates()
-        if request.method == "POST":
-            if request.form.get("steps", type=int) is None or not minimum_days <= days <= maximum_days:
+        cutoffs = [day for day, _ in rows[2:-TEST_DAYS]]
+        if submitted and action != "week":
+            if entered_days is None or not minimum_days <= days <= maximum_days:
                 raise ValueError(f"Enter a whole number from {minimum_days} to {maximum_days} for Days ahead.")
-            if request.form.get("threads", type=int) not in THREAD_CHOICES:
+            if entered_threads not in THREAD_CHOICES:
                 raise ValueError("Choose 1, 2, 4, or 6 OpenMP threads.")
-            if mode not in (*MODES, "compare"):
+            if mode not in DEMO_MODES:
                 raise ValueError("Choose Serial, OpenMP, or Compare.")
 
-            if action == "reset":
-                demo_step = 0
-            elif action in ("demo", "forecast"):
-                if not BENCHMARK_LOCK.acquire(blocking=False):
-                    raise RuntimeError("A run is already in progress. Try again in a moment.")
-                try:
-                    if action == "demo":
-                        same_mode = (mode, threads) == (previous_mode, previous_threads)
-                        step = demo_step + 1 if same_mode else 1
-                        if step > DEMO_STEPS:
-                            raise ValueError("You reached the last training step. Click Start over.")
-                        demo_results = run_demo(rows, mode, step, threads)
-                        demo_step = step
-                        previous_mode, previous_threads = mode, threads
-                        for result in demo_results.values():
-                            result["groups"] = group_calculations(result)
-                    else:
-                        report = make_forecast(rows, days, PREDICTION_LIMITS["iterations"][0], threads)
-                finally:
-                    BENCHMARK_LOCK.release()
+        if action == "reset":
+            demo_step = 0
+        elif action in ("demo", "forecast", "week"):
+            if not BENCHMARK_LOCK.acquire(blocking=False):
+                raise RuntimeError("A run is already in progress. Try again in a moment.")
+            try:
+                if action == "demo":
+                    step = 1
+                    if mode == previous_mode and threads == previous_threads:
+                        step = demo_step + 1
+                    if step > DEMO_STEPS:
+                        raise ValueError("You reached the last training step. Click Start over.")
+                    demo_results = run_demo(rows, mode, step, threads)
+                    demo_step = step
+                    previous_mode, previous_threads = mode, threads
+                    for result in demo_results.values():
+                        result["groups"] = group_calculations(result)
+                elif action == "week":
+                    if not cutoffs:
+                        raise ValueError("Use a CSV with at least ten rates to run this test.")
+                    try:
+                        cutoff_day = date.fromisoformat(cutoff) if cutoff else cutoffs[-1]
+                    except ValueError:
+                        raise ValueError("Choose a valid cutoff date.") from None
+                    week = test_week(rows, cutoff_day)
+                else:
+                    report = make_forecast(rows, days, PREDICTION_LIMITS["iterations"][0], threads)
+            finally:
+                BENCHMARK_LOCK.release()
     except subprocess.TimeoutExpired:
         error = "The model took too long. Try again."
     except (OSError, ValueError, KeyError, RuntimeError) as problem:
@@ -240,6 +392,12 @@ def index():
     return render_template(
         "index.html",
         days=days,
+        weekdays_only=uses_weekdays(rows),
+        observations=len(rows),
+        first_date=rows[0][0] if rows else None,
+        last_date=rows[-1][0] if rows else None,
+        using_upload=(ROOT / UPLOAD_NAME).is_file(),
+        dataset_error=dataset_error,
         forecast_days=(minimum_days, maximum_days),
         threads=threads,
         thread_choices=THREAD_CHOICES,
@@ -250,10 +408,39 @@ def index():
         previous_threads=previous_threads,
         demo_results=demo_results,
         report=report,
+        week=week,
+        cutoffs=cutoffs,
+        test_start=rows[-TEST_DAYS][0] if cutoffs else None,
+        cutoff=cutoff or (cutoffs[-1].isoformat() if cutoffs else ""),
         chart=chart,
+        daily_chart=make_daily_chart(report["forecast"]) if report else None,
         error=error,
         action=action,
     )
+
+
+@app.post("/dataset")
+def change_dataset():
+    request.max_content_length = UPLOAD_LIMIT
+    try:
+        action = request.form.get("action")
+        if action == "reset":
+            (ROOT / UPLOAD_NAME).unlink(missing_ok=True)
+        else:
+            uploaded = request.files.get("rates")
+            if not uploaded or not uploaded.filename:
+                raise ValueError("Choose a CSV file to upload.")
+            content = uploaded.read().decode("utf-8-sig")
+            save_upload(read_rates(io.StringIO(content, newline="")))
+    except RequestEntityTooLarge:
+        return show_dashboard(dataset_error="Choose a CSV under 2 MB."), 413
+    except UnicodeDecodeError:
+        return show_dashboard(dataset_error="Save your file as a UTF-8 CSV and try again."), 400
+    except (csv.Error, ValueError) as error:
+        return show_dashboard(dataset_error=str(error)), 400
+    except OSError:
+        return show_dashboard(dataset_error="Could not save the dataset. Close the CSV if it is open and try again."), 500
+    return redirect(url_for("index", _anchor="dataset"), code=303)
 
 
 @app.get("/source")
@@ -271,7 +458,7 @@ def demo():
     step = payload.get("step")
     default, minimum, maximum = PREDICTION_LIMITS["threads"]
     threads = payload.get("threads", default)
-    if mode not in (*MODES, "compare"):
+    if mode not in DEMO_MODES:
         return jsonify(error="Choose Serial, OpenMP, or Compare."), 400
     if type(step) is not int or not 1 <= step <= DEMO_STEPS:
         return jsonify(error=f"Choose a step from 1 to {DEMO_STEPS}."), 400

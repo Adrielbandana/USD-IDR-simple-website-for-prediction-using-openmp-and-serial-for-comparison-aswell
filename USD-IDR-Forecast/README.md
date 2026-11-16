@@ -1,18 +1,15 @@
 # USD/IDR Forecast
 
-This app reads data.csv and compares Serial and OpenMP training times.
+1. Open the web thingymajigy folder in VS Code.
+2. Press F5. If asked, choose Run USD/IDR dashboard.
+3. Go to http://127.0.0.1:5000.
 
-Open this folder in VS Code and run these commands in the terminal:
+Choose an OpenMP thread count, pick a mode, and click Train one step.
+Set Days ahead (1 to 365) and click Run forecast.
 
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+The app reads data.csv and shows how long Serial and OpenMP take to train.
+To use your own data, upload a CSV with Date and USD_IDR_Rate columns. Use YYYY-MM-DD dates.
 
-## Run
-
-1. Press F5 and choose **Run USD/IDR dashboard** if asked.
-2. Open http://127.0.0.1:5000.
-3. Pick the number of threads and click **Train one step**, or set **Days ahead** and click **Run forecast**.
+Use Test a past week to compare seven predicted rates with the CSV.
 
 Press Shift+F5 to stop the app.
