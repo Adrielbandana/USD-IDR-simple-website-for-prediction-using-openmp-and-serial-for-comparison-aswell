@@ -95,7 +95,7 @@ int main(int argc, char* argv[])
         int count, iterations, steps, requestedThreads;
         if (!(std::cin >> count >> iterations >> steps >> requestedThreads)
             || count < 3 || count > 10000 || iterations < 1 || iterations > 20000
-            || steps < 1 || steps > 60 || requestedThreads < 1 || requestedThreads > 6) {
+            || steps < 1 || steps > 365 || requestedThreads < 1 || requestedThreads > 6) {
             throw std::runtime_error("Invalid model settings.");
         }
 
