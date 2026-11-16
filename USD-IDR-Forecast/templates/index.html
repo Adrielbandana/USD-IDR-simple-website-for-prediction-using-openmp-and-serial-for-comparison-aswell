@@ -14,6 +14,8 @@
     .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     input, select, button { padding: 6px 8px; font: inherit; }
     input { width: 60px; }
+    input[type="date"] { width: auto; }
+    input[type="file"] { width: auto; max-width: 100%; }
     button { color: white; background: #24553b; border: 1px solid #24553b; border-radius: 4px; cursor: pointer; }
     .reset { color: #24553b; background: transparent; }
     .comparison { display: flex; flex-wrap: wrap; gap: 18px; }
@@ -23,6 +25,8 @@
     figure { margin: 22px 0; }
     figcaption { color: #555d55; font-size: 14px; }
     svg { display: block; width: 100%; }
+    .daily-chart { overflow-x: auto; border-bottom: 1px solid #d9ded8; }
+    .daily-chart svg { height: 180px; max-width: none; }
     details { margin: 10px 0; }
     summary { cursor: pointer; }
     pre { overflow: auto; max-height: 440px; padding: 10px; background: #eef0ec; }
@@ -46,7 +50,23 @@
     {% else %}
       <h1>USD/IDR forecast</h1>
       <p>Indonesian rupiah per US dollar</p>
-      {% if error and action not in ("demo", "reset", "forecast") %}
+      <section class="results" id="dataset">
+        <h2>Exchange rate data</h2>
+        {% if observations %}
+          <p>{{ "Uploaded CSV" if using_upload else "Original CSV" }} · {{ observations }} rates from {{ first_date }} to {{ last_date }}</p>
+        {% endif %}
+        <form class="controls" method="post" enctype="multipart/form-data" action="{{ url_for('change_dataset') }}#dataset">
+          <label for="rates-file">USD/IDR CSV</label>
+          <input id="rates-file" name="rates" type="file" accept=".csv,text/csv" aria-describedby="csv-format" required>
+          <button type="submit" name="action" value="upload">Use this CSV</button>
+          {% if using_upload %}
+            <button class="reset" type="submit" name="action" value="reset" formnovalidate>Use original data</button>
+          {% endif %}
+        </form>
+        <p id="csv-format">Use dates like 2026-08-31 and rates like 17689.90. Name the columns Date and USD_IDR_Rate (or Rate or Close).</p>
+        {% if dataset_error %}<p class="error" role="alert">{{ dataset_error }}</p>{% endif %}
+      </section>
+      {% if error and action not in ("demo", "reset", "forecast", "week") %}
         <p class="error" role="alert">{{ error }}</p>
       {% endif %}
       <form method="post" action="{{ url_for('index') }}">
@@ -102,7 +122,7 @@
         <section id="forecast">
           <h2>Forecast and timing</h2>
           <div class="controls">
-            <label for="days-ahead">Days ahead</label>
+            <label for="days-ahead">{{ "Weekdays ahead" if weekdays_only else "Days ahead" }}</label>
             <input id="days-ahead" name="steps" type="number" min="{{ forecast_days[0] }}" max="{{ forecast_days[1] }}" value="{{ days }}" required>
             <button type="submit" name="action" value="forecast" formaction="{{ url_for('index') }}#forecast">Run forecast</button>
           </div>
@@ -131,6 +151,29 @@
       {% endif %}
 
       {% if report %}
+        <figure>
+          <h2>Forecast by day</h2>
+          <div class="daily-chart" role="region" aria-label="Scrollable daily forecast" tabindex="0">
+            <svg viewBox="0 0 {{ daily_chart.width }} 180" style="width: {{ daily_chart.width }}px" role="img" aria-label="Predicted rupiah per US dollar, with one vertical guide per forecast date">
+              <path class="day-guides" d="{{ daily_chart.guides }}" fill="none" stroke="#d9ded8" />
+              <g fill="#555d55" font-size="12" dominant-baseline="middle">
+                {% for y, label in daily_chart.ticks %}
+                  <line x1="78" x2="{{ daily_chart.width - 22 }}" y1="{{ y }}" y2="{{ y }}" stroke="#d9ded8" />
+                  <text x="69" y="{{ y }}" text-anchor="end">{{ label }}</text>
+                {% endfor %}
+                <g text-anchor="middle">
+                  {% for day in daily_chart.days -%}
+                    <text x="{{ day.x }}" y="163">{{ day.label }}</text>
+                  {%- endfor %}
+                </g>
+              </g>
+              <polyline points="{{ daily_chart.line }}" fill="none" stroke="#24553b" stroke-width="2" />
+              <path d="{{ daily_chart.dots }}" fill="none" stroke="#24553b" stroke-width="5" stroke-linecap="round" />
+            </svg>
+          </div>
+          {% if daily_chart.width > 620 %}<figcaption>Scroll sideways to see the rest of the forecast.</figcaption>{% endif %}
+        </figure>
+
         <section class="results">
           <h2>Training time</h2>
           <div class="comparison">
@@ -139,7 +182,7 @@
               <strong>{{ "%.2f" | format(report.timings.openmp.median_ms) }} ms</strong></div>
           </div>
           <details>
-            <summary>Daily forecast values ({{ report.forecast | length }} days)</summary>
+            <summary>Daily forecast values ({{ report.forecast | length }} {{ "weekdays" if weekdays_only else "days" }})</summary>
             <table>
               <thead><tr><th scope="col">Date</th><th scope="col">Predicted IDR</th></tr></thead>
               <tbody>
@@ -151,6 +194,62 @@
           </details>
         </section>
       {% endif %}
+
+      <section class="results" id="week-test">
+        <h2>Test a past week</h2>
+        {% if cutoffs %}
+          {% set first = cutoffs[0] %}
+          {% set last = cutoffs[-1] %}
+          <p>The app uses <strong>{{ last.strftime("%d %b %Y") }}</strong> as the cutoff by default.
+            It trains through that date, then checks the seven recorded rates from <strong>{{ test_start.strftime("%d %b %Y") }}</strong>
+            through <strong>{{ last_date.strftime("%d %b %Y") }}</strong>.</p>
+          <form class="controls" method="post" action="{{ url_for('index') }}#week-test">
+            <button type="submit" name="action" value="week">Test 7 rates</button>
+          </form>
+          {% if first != last %}
+            {% set dates_are_consecutive = cutoffs | length == (last - first).days + 1 %}
+            <details{% if action == "week" and cutoff != last.isoformat() %} open{% endif %}>
+              <summary>Choose a different cutoff</summary>
+              <p id="cutoff-dates">
+                {% if dates_are_consecutive %}
+                  You can use any date from <strong>{{ first.strftime("%d %b %Y") }}</strong> through <strong>{{ last.strftime("%d %b %Y") }}</strong>.
+                {% else %}
+                  The dropdown lists dates with seven later rates to check.
+                {% endif %}
+              </p>
+              <form class="controls" method="post" action="{{ url_for('index') }}#week-test">
+                <label for="cutoff">Last day used for training</label>
+                {% if dates_are_consecutive %}
+                  <input id="cutoff" name="cutoff" type="date" min="{{ first }}" max="{{ last }}" value="{{ cutoff }}" aria-describedby="cutoff-dates" required>
+                {% else %}
+                  <select id="cutoff" name="cutoff" aria-describedby="cutoff-dates" required>
+                    {% for day in cutoffs -%}
+                      <option value="{{ day }}"{% if day.isoformat() == cutoff %} selected{% endif %}>{{ day.strftime("%d %b %Y") }}</option>
+                    {%- endfor %}
+                  </select>
+                {% endif %}
+                <button type="submit" name="action" value="week">Test selected date</button>
+              </form>
+            </details>
+          {% endif %}
+        {% else %}
+          <p>Use a CSV with at least ten rates to test seven of them.</p>
+        {% endif %}
+        {% if error and action == "week" %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+        {% if week %}
+          <p>Trained through <strong>{{ week.cutoff.strftime("%d %b %Y") }}</strong>.</p>
+          <p>Average miss with the model <strong>{{ "{:,.2f}".format(week.model_error) }} IDR</strong><br>
+            Average miss if you keep the last known rate <strong>{{ "{:,.2f}".format(week.baseline_error) }} IDR</strong></p>
+          <table>
+            <thead><tr><th scope="col">Date</th><th scope="col">Predicted IDR</th><th scope="col">Actual IDR</th></tr></thead>
+            <tbody>
+              {% for day in week.days %}
+                <tr><td>{{ day.date }}</td><td>{{ "{:,.2f}".format(day.predicted) }}</td><td>{{ "{:,.2f}".format(day.actual) }}</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+      </section>
     {% endif %}
   </main>
 </body>
